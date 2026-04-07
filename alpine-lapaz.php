@@ -715,6 +715,12 @@ final class UXValidator
             $issues[] = 'Session flow is not coherent';
         }
 
+        if (($generated['keyboard_configured'] ?? false) === true) {
+            $passes[] = 'Keyboard layout is configured for pt-BR in session startup';
+        } else {
+            $issues[] = 'Keyboard layout is not configured in session startup';
+        }
+
         return new UXValidationReport($passes, $warnings, $issues);
     }
 
@@ -892,6 +898,7 @@ final class Provisioner
             'xrandr',
             'xsetroot',
             'xauth',
+            'setxkbmap',
 
             'eudev',
             'eudev-openrc',
@@ -1052,7 +1059,7 @@ final class Provisioner
      */
     private function determineRuntimeCommands(): array
     {
-        foreach (['herbstluftwm', 'herbstclient', 'rofi'] as $cmd) {
+        foreach (['herbstluftwm', 'herbstclient', 'rofi', 'setxkbmap'] as $cmd) {
             if (!$this->runner->exists($cmd)) {
                 throw new CliException("Required runtime command missing after installation: {$cmd}", ExitCode::PACKAGE);
             }
@@ -1129,7 +1136,7 @@ final class Provisioner
             $hasScreenshotStack
         );
 
-        $rofi = $this->buildRofiConfig($background, $foreground, $accent);
+        $rofi = $this->buildRofiConfig();
         $dunst = $this->buildDunstConfig($background, $foreground, $accent, $font, $fontSize);
         $alacritty = $this->buildAlacrittyConfig($background, $foreground, $font, $fontSize);
         $xresources = $this->buildXresources($background, $foreground, $font);
@@ -1162,11 +1169,12 @@ final class Provisioner
             'launcher_shortcut' => 'Mod4-d',
             'terminal_shortcut' => 'Mod4-Return',
             'notification_timeout' => 6000,
-            'session_components' => ['dbus', 'elogind', 'dunst', 'picom', 'feh', 'pipewire', 'wireplumber'],
+            'session_components' => ['dbus', 'elogind', 'dunst', 'picom', 'feh', 'pipewire', 'wireplumber', 'setxkbmap'],
             'theme_noise' => 'low',
             'keybindings_documented' => true,
             'immediate_usability' => true,
             'session_flow_ok' => true,
+            'keyboard_configured' => true,
         ];
     }
 
@@ -1196,6 +1204,10 @@ export TERMINAL={$terminal}
 
 if [ -z "\${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/\$(id -u)" ]; then
     export XDG_RUNTIME_DIR="/run/user/\$(id -u)"
+fi
+
+if command -v setxkbmap >/dev/null 2>&1; then
+    setxkbmap -layout br -variant abnt2
 fi
 
 hc() { herbstclient "\$@"; }
@@ -1306,9 +1318,9 @@ hc rule class='feh' floating=on
 SH;
     }
 
-    private function buildRofiConfig(string $background, string $foreground, string $accent): string
+    private function buildRofiConfig(): string
     {
-        return <<<RASI
+        return <<<'RASI'
 configuration {
     modi: "drun,run,window";
     show-icons: true;
@@ -1323,20 +1335,24 @@ configuration {
 }
 
 * {
-    background: {$background};
-    background-alt: #111827;
-    foreground: {$foreground};
-    selected: {$accent};
-    urgent: #b45309;
-    border-color: #4b5563;
+    bg:           #1f2937;
+    bg-alt:       #111827;
+    fg:           #e5e7eb;
+    fg-muted:     #cbd5e1;
+    accent:       #94a3b8;
+    border:       #4b5563;
+    selected-bg:  #334155;
+    selected-fg:  #f9fafb;
+    urgent-bg:    #7c2d12;
+    urgent-fg:    #f9fafb;
 }
 
 window {
     width: 42%;
     border: 2px;
-    border-color: @border-color;
+    border-color: @border;
     border-radius: 6px;
-    background-color: @background;
+    background-color: @bg;
     padding: 12px;
 }
 
@@ -1346,20 +1362,22 @@ mainbox {
 }
 
 inputbar {
-    background-color: @background-alt;
-    text-color: @foreground;
+    background-color: @bg-alt;
+    text-color: @fg;
     border-radius: 4px;
     padding: 8px 10px;
     children: [ prompt, entry ];
 }
 
 prompt {
-    text-color: @selected;
+    text-color: @accent;
+    background-color: transparent;
     padding: 0px 8px 0px 0px;
 }
 
 entry {
-    text-color: @foreground;
+    text-color: @fg;
+    background-color: transparent;
     placeholder: "Search applications, commands, or windows";
     placeholder-color: #9ca3af;
 }
@@ -1377,17 +1395,81 @@ element {
     padding: 8px 10px;
     border-radius: 4px;
     background-color: transparent;
-    text-color: @foreground;
+    text-color: @fg;
 }
 
-element selected {
-    background-color: #334155;
-    text-color: @foreground;
+element normal.normal {
+    background-color: transparent;
+    text-color: @fg;
 }
 
-element-text, element-icon {
-    background-color: inherit;
+element alternate.normal {
+    background-color: transparent;
+    text-color: @fg;
+}
+
+element selected.normal {
+    background-color: @selected-bg;
+    text-color: @selected-fg;
+}
+
+element selected.active {
+    background-color: @selected-bg;
+    text-color: @selected-fg;
+}
+
+element selected.urgent {
+    background-color: @urgent-bg;
+    text-color: @urgent-fg;
+}
+
+element-text {
+    background-color: transparent;
     text-color: inherit;
+    vertical-align: 0.5;
+}
+
+element-text normal.normal {
+    background-color: transparent;
+    text-color: @fg;
+}
+
+element-text alternate.normal {
+    background-color: transparent;
+    text-color: @fg;
+}
+
+element-text selected.normal {
+    background-color: transparent;
+    text-color: @selected-fg;
+}
+
+element-text selected.active {
+    background-color: transparent;
+    text-color: @selected-fg;
+}
+
+element-text selected.urgent {
+    background-color: transparent;
+    text-color: @urgent-fg;
+}
+
+element-icon {
+    background-color: transparent;
+    text-color: inherit;
+    size: 1.2em;
+}
+
+element-icon selected.normal {
+    background-color: transparent;
+    text-color: @selected-fg;
+}
+
+scrollbar {
+    background-color: @bg-alt;
+    handle-color: @border;
+    handle-width: 6px;
+    border-radius: 3px;
 }
 RASI;
     }
@@ -1573,6 +1655,10 @@ Super + Arrow keys    Focus neighboring window
 Super + Shift + Arrow keys  Move window
 Super + Ctrl + Arrow keys   Resize split
 {$screenshotLines}
+Keyboard
+--------
+- Session startup forces: setxkbmap -layout br -variant abnt2
+
 Startup
 -------
 Run: startx
