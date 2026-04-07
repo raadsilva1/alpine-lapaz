@@ -32,8 +32,10 @@ final class Ansi
 
 final class CliException extends RuntimeException
 {
-    public function __construct(string $message, private readonly int $exitCode = ExitCode::INTERNAL)
-    {
+    public function __construct(
+        string $message,
+        private readonly int $exitCode = ExitCode::INTERNAL
+    ) {
         parent::__construct($message);
     }
 
@@ -55,21 +57,17 @@ final class CommandResult
 
 final class Logger
 {
-    private string $logFile;
-
-    public function __construct(string $logFile)
+    public function __construct(private readonly string $logFile)
     {
-        $this->logFile = $logFile;
-        $dir = dirname($logFile);
+        $dir = dirname($this->logFile);
         if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
             throw new CliException("Unable to create log directory: {$dir}", ExitCode::FILESYSTEM);
         }
     }
 
-    public function log(string $level, string $message): void
+    public function debug(string $message): void
     {
-        $line = sprintf("[%s] [%s] %s\n", date('c'), strtoupper($level), $message);
-        file_put_contents($this->logFile, $line, FILE_APPEND);
+        $this->log('DEBUG', $message);
     }
 
     public function info(string $message): void
@@ -92,15 +90,21 @@ final class Logger
         $this->console('ERROR', $message, Ansi::RED);
     }
 
+    public function path(): string
+    {
+        return $this->logFile;
+    }
+
     private function console(string $level, string $message, string $color): void
     {
         $this->log($level, $message);
         fwrite(STDOUT, sprintf("%s[%s]%s %s\n", $color, $level, Ansi::RESET, $message));
     }
 
-    public function path(): string
+    private function log(string $level, string $message): void
     {
-        return $this->logFile;
+        $line = sprintf("[%s] [%s] %s\n", date('c'), $level, $message);
+        file_put_contents($this->logFile, $line, FILE_APPEND);
     }
 }
 
@@ -108,13 +112,22 @@ final class ProgressRenderer
 {
     private int $current = 0;
 
-    public function __construct(private readonly int $total, private readonly Logger $logger) {}
+    public function __construct(
+        private readonly int $total,
+        private readonly Logger $logger
+    ) {}
 
     public function phase(string $title): void
     {
         $this->current++;
-        $prefix = sprintf("%s[%d/%d]%s", Ansi::BOLD, $this->current, $this->total, Ansi::RESET);
-        $this->logger->info("{$prefix} {$title}");
+        $this->logger->info(sprintf(
+            "%s[%d/%d]%s %s",
+            Ansi::BOLD,
+            $this->current,
+            $this->total,
+            Ansi::RESET,
+            $title
+        ));
     }
 }
 
@@ -124,15 +137,15 @@ final class CommandRunner
 
     public function run(string $command, bool $mustSucceed = true): CommandResult
     {
-        $this->logger->log('DEBUG', "Executing command: {$command}");
+        $this->logger->debug("Executing command: {$command}");
 
-        $descriptorSpec = [
+        $spec = [
             0 => ['file', '/dev/null', 'r'],
             1 => ['pipe', 'w'],
             2 => ['pipe', 'w'],
         ];
 
-        $process = proc_open(['/bin/sh', '-c', $command], $descriptorSpec, $pipes);
+        $process = proc_open(['/bin/sh', '-c', $command], $spec, $pipes);
         if (!is_resource($process)) {
             throw new CliException("Failed to start command: {$command}", ExitCode::INTERNAL);
         }
@@ -145,14 +158,19 @@ final class CommandRunner
 
         $exitCode = proc_close($process);
 
-        $result = new CommandResult($exitCode, trim($stdout), trim($stderr), $command);
+        $result = new CommandResult(
+            $exitCode,
+            trim($stdout),
+            trim($stderr),
+            $command
+        );
 
-        if ($mustSucceed && $exitCode !== 0) {
-            $message = "Command failed [{$exitCode}]: {$command}";
-            if ($stderr !== '') {
-                $message .= " | stderr: {$stderr}";
-            }
-            throw new CliException($message, ExitCode::INTERNAL);
+        if ($mustSucceed && $result->exitCode !== 0) {
+            $detail = $result->stderr !== '' ? $result->stderr : $result->stdout;
+            throw new CliException(
+                "Command failed [{$result->exitCode}]: {$command}" . ($detail !== '' ? " | {$detail}" : ''),
+                ExitCode::INTERNAL
+            );
         }
 
         return $result;
@@ -160,17 +178,29 @@ final class CommandRunner
 
     public function exists(string $binary): bool
     {
-        $result = $this->run("command -v " . escapeshellarg($binary) . " >/dev/null 2>&1", false);
-        return $result->exitCode === 0;
+        return $this->run('command -v ' . escapeshellarg($binary) . ' >/dev/null 2>&1', false)->exitCode === 0;
+    }
+
+    public function firstExisting(array $commands): ?string
+    {
+        foreach ($commands as $cmd) {
+            if ($this->exists($cmd)) {
+                return $cmd;
+            }
+        }
+        return null;
     }
 }
 
 final class BackupManager
 {
+    /** @var array<string,string> */
     private array $backups = [];
 
-    public function __construct(private readonly string $transactionDir, private readonly Logger $logger)
-    {
+    public function __construct(
+        private readonly string $transactionDir,
+        private readonly Logger $logger
+    ) {
         if (!is_dir($this->transactionDir) && !@mkdir($this->transactionDir, 0700, true) && !is_dir($this->transactionDir)) {
             throw new CliException("Unable to create transaction directory: {$this->transactionDir}", ExitCode::FILESYSTEM);
         }
@@ -178,30 +208,26 @@ final class BackupManager
 
     public function backupIfExists(string $path): void
     {
-        if (!file_exists($path) && !is_link($path)) {
+        if ((!file_exists($path) && !is_link($path)) || isset($this->backups[$path])) {
             return;
         }
 
-        if (isset($this->backups[$path])) {
-            return;
-        }
-
-        $safeName = ltrim(str_replace('/', '__', $path), '_');
-        $backupPath = $this->transactionDir . '/backup-' . $safeName;
+        $safe = ltrim(str_replace('/', '__', $path), '_');
+        $target = $this->transactionDir . '/backup-' . $safe;
 
         if (is_link($path)) {
-            $target = readlink($path);
-            if ($target === false) {
-                throw new CliException("Unable to read symlink for backup: {$path}", ExitCode::FILESYSTEM);
+            $linkTarget = readlink($path);
+            if ($linkTarget === false) {
+                throw new CliException("Unable to read symlink: {$path}", ExitCode::FILESYSTEM);
             }
-            file_put_contents($backupPath . '.symlink', $target);
-            $this->backups[$path] = $backupPath . '.symlink';
+            file_put_contents($target . '.symlink', $linkTarget);
+            $this->backups[$path] = $target . '.symlink';
         } else {
-            if (!copy($path, $backupPath)) {
+            if (!copy($path, $target)) {
                 throw new CliException("Unable to backup file: {$path}", ExitCode::FILESYSTEM);
             }
-            @chmod($backupPath, fileperms($path) & 0777);
-            $this->backups[$path] = $backupPath;
+            @chmod($target, fileperms($path) & 0777);
+            $this->backups[$path] = $target;
         }
 
         $this->logger->info("Backed up: {$path}");
@@ -225,14 +251,15 @@ final class BackupManager
         }
     }
 
-    public function list(): array
-    {
-        return $this->backups;
-    }
-
     public function dir(): string
     {
         return $this->transactionDir;
+    }
+
+    /** @return array<string,string> */
+    public function list(): array
+    {
+        return $this->backups;
     }
 }
 
@@ -248,20 +275,19 @@ final class FileManager
         if (!is_dir($path) && !@mkdir($path, $mode, true) && !is_dir($path)) {
             throw new CliException("Failed to create directory: {$path}", ExitCode::FILESYSTEM);
         }
+
         @chmod($path, $mode);
-        if ($uid !== null && $gid !== null) {
+
+        if ($uid !== null) {
             @chown($path, $uid);
+        }
+        if ($gid !== null) {
             @chgrp($path, $gid);
         }
     }
 
-    public function writeAtomic(
-        string $path,
-        string $content,
-        int $mode = 0644,
-        ?int $uid = null,
-        ?int $gid = null
-    ): bool {
+    public function writeAtomic(string $path, string $content, int $mode = 0644, ?int $uid = null, ?int $gid = null): bool
+    {
         $dir = dirname($path);
         $this->ensureDir($dir);
 
@@ -275,7 +301,7 @@ final class FileManager
 
         $temp = $path . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
         if (file_put_contents($temp, $content) === false) {
-            throw new CliException("Failed to stage file: {$temp}", ExitCode::FILESYSTEM);
+            throw new CliException("Failed to write temp file: {$temp}", ExitCode::FILESYSTEM);
         }
 
         @chmod($temp, $mode);
@@ -309,15 +335,17 @@ final class UserTarget
 
 final class EnvironmentState
 {
+    /**
+     * @param UserTarget[] $candidateUsers
+     */
     public function __construct(
         public readonly bool $isAlpine,
         public readonly bool $isRoot,
         public readonly bool $apkAvailable,
         public readonly bool $networkOk,
         public readonly bool $reposReadable,
-        public readonly bool $xorgInstalled,
-        public readonly bool $herbstInstalled,
-        public readonly bool $rofiInstalled,
+        public readonly bool $mainRepoOk,
+        public readonly bool $communityRepoOk,
         public readonly array $candidateUsers
     ) {}
 }
@@ -329,20 +357,23 @@ final class EnvironmentDetector
         private readonly Logger $logger
     ) {}
 
+    /**
+     * @return array{0:EnvironmentState,1:UserTarget}
+     */
     public function detect(?string $requestedUser): array
     {
         $isAlpine = file_exists('/etc/alpine-release');
-        $isRoot = function_exists('posix_geteuid') ? posix_geteuid() === 0 : trim((string) shell_exec('id -u')) === '0';
+        $isRoot = function_exists('posix_geteuid')
+            ? posix_geteuid() === 0
+            : trim((string) shell_exec('id -u')) === '0';
+
         $apkAvailable = $this->runner->exists('apk');
         $reposReadable = is_readable('/etc/apk/repositories');
         $networkOk = $this->checkNetwork();
+        [$mainRepoOk, $communityRepoOk] = $this->probeRepositories();
 
-        $xorgInstalled = $this->pkgInstalled('xorg-server') || $this->pkgInstalled('xinit');
-        $herbstInstalled = $this->pkgInstalled('herbstluftwm');
-        $rofiInstalled = $this->pkgInstalled('rofi');
-
-        $candidates = $this->detectUsers();
-        $target = $this->selectUser($requestedUser, $candidates);
+        $users = $this->detectUsers();
+        $target = $this->selectUser($requestedUser, $users);
 
         return [
             new EnvironmentState(
@@ -351,13 +382,72 @@ final class EnvironmentDetector
                 $apkAvailable,
                 $networkOk,
                 $reposReadable,
-                $xorgInstalled,
-                $herbstInstalled,
-                $rofiInstalled,
-                $candidates
+                $mainRepoOk,
+                $communityRepoOk,
+                $users
             ),
             $target
         ];
+    }
+
+    public function assertRepositorySanity(): void
+    {
+        $repoFile = '/etc/apk/repositories';
+        $content = is_readable($repoFile) ? (string) file_get_contents($repoFile) : '';
+
+        if ($content === '') {
+            throw new CliException('Repository file is missing or unreadable: /etc/apk/repositories', ExitCode::PREFLIGHT);
+        }
+
+        $lines = preg_split('/\R+/', $content) ?: [];
+        $active = array_values(array_filter(array_map('trim', $lines), static function (string $line): bool {
+            return $line !== '' && !str_starts_with($line, '#');
+        }));
+
+        if ($active === []) {
+            throw new CliException('No active repositories found in /etc/apk/repositories', ExitCode::PREFLIGHT);
+        }
+
+        $hasMain = false;
+        $hasCommunity = false;
+        $hasNetworkMirror = false;
+
+        foreach ($active as $line) {
+            if (str_contains($line, '/main')) {
+                $hasMain = true;
+            }
+            if (str_contains($line, '/community')) {
+                $hasCommunity = true;
+            }
+            if (str_starts_with($line, 'http://') || str_starts_with($line, 'https://')) {
+                $hasNetworkMirror = true;
+            }
+        }
+
+        if (!$hasMain) {
+            throw new CliException('Main repository is not enabled in /etc/apk/repositories.', ExitCode::PREFLIGHT);
+        }
+
+        if (!$hasCommunity) {
+            throw new CliException('Community repository is not enabled in /etc/apk/repositories.', ExitCode::PREFLIGHT);
+        }
+
+        if (!$hasNetworkMirror) {
+            throw new CliException(
+                'Repositories appear to point only to local/install media paths. Configure normal Alpine mirrors first.',
+                ExitCode::PREFLIGHT
+            );
+        }
+
+        $mainProbe = $this->runner->run('apk search -x alsa-utils', false);
+        if (!$this->apkSearchContainsPackage($mainProbe->stdout, 'alsa-utils')) {
+            throw new CliException('Main repository probe failed for alsa-utils.', ExitCode::PREFLIGHT);
+        }
+
+        $communityProbe = $this->runner->run('apk search -x rofi', false);
+        if (!$this->apkSearchContainsPackage($communityProbe->stdout, 'rofi')) {
+            throw new CliException('Community repository probe failed for rofi.', ExitCode::PREFLIGHT);
+        }
     }
 
     private function checkNetwork(): bool
@@ -368,18 +458,41 @@ final class EnvironmentDetector
         ];
 
         foreach ($tests as $test) {
-            $result = $this->runner->run($test, false);
-            if ($result->exitCode === 0) {
+            if ($this->runner->run($test, false)->exitCode === 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return array{0:bool,1:bool}
+     */
+    private function probeRepositories(): array
+    {
+        $main = $this->runner->run('apk search -x alsa-utils', false);
+        $community = $this->runner->run('apk search -x rofi', false);
+
+        return [
+            $this->apkSearchContainsPackage($main->stdout, 'alsa-utils'),
+            $this->apkSearchContainsPackage($community->stdout, 'rofi'),
+        ];
+    }
+
+    private function apkSearchContainsPackage(string $stdout, string $package): bool
+    {
+        $lines = preg_split('/\R+/', trim($stdout)) ?: [];
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === $package) {
+                return true;
+            }
+            if (preg_match('/^' . preg_quote($package, '/') . '-[0-9]/', $line) === 1) {
                 return true;
             }
         }
         return false;
-    }
-
-    private function pkgInstalled(string $name): bool
-    {
-        $result = $this->runner->run('apk info -e ' . escapeshellarg($name), false);
-        return $result->exitCode === 0;
     }
 
     /**
@@ -411,7 +524,7 @@ final class EnvironmentDetector
             $users[] = new UserTarget($name, $uid, $gid, $home, $shell);
         }
 
-        usort($users, fn(UserTarget $a, UserTarget $b) => $a->uid <=> $b->uid);
+        usort($users, static fn(UserTarget $a, UserTarget $b): int => $a->uid <=> $b->uid);
         return $users;
     }
 
@@ -426,7 +539,7 @@ final class EnvironmentDetector
                     return $user;
                 }
             }
-            throw new CliException("Requested target user not found or not suitable: {$requestedUser}", ExitCode::PREFLIGHT);
+            throw new CliException("Requested target user not found or unsuitable: {$requestedUser}", ExitCode::PREFLIGHT);
         }
 
         if (count($users) === 1) {
@@ -443,14 +556,14 @@ final class EnvironmentDetector
         }
 
         if (count($users) > 1) {
-            $names = implode(', ', array_map(fn(UserTarget $u) => $u->username, $users));
+            $names = implode(', ', array_map(static fn(UserTarget $u): string => $u->username, $users));
             throw new CliException(
                 "Multiple desktop user candidates found ({$names}). Re-run with --user=<name>.",
                 ExitCode::PREFLIGHT
             );
         }
 
-        throw new CliException("No suitable non-root desktop user detected.", ExitCode::PREFLIGHT);
+        throw new CliException('No suitable non-root desktop user detected.', ExitCode::PREFLIGHT);
     }
 }
 
@@ -469,69 +582,58 @@ final class PackageManager
 
     /**
      * @param string[] $packages
-     * @return array{installable: string[], missing: string[], alreadyInstalled: string[]}
+     * @return array{installable:string[],alreadyInstalled:string[]}
      */
     public function resolvePackages(array $packages): array
     {
         $installable = [];
-        $missing = [];
         $alreadyInstalled = [];
 
         foreach ($packages as $pkg) {
             if ($this->isInstalled($pkg)) {
                 $alreadyInstalled[] = $pkg;
-                continue;
-            }
-
-            if ($this->existsInRepos($pkg)) {
-                $installable[] = $pkg;
             } else {
-                $missing[] = $pkg;
+                $installable[] = $pkg;
             }
         }
 
         return [
             'installable' => $installable,
-            'missing' => $missing,
             'alreadyInstalled' => $alreadyInstalled,
         ];
     }
 
     /**
      * @param string[] $packages
+     * @return array{installed:string[],failed:array<string,string>}
      */
-    public function install(array $packages): void
+    public function install(array $packages): array
     {
-        if ($packages === []) {
-            $this->logger->info('No packages needed for installation');
-            return;
+        $installed = [];
+        $failed = [];
+
+        foreach ($packages as $pkg) {
+            $result = $this->runner->run('apk add --no-interactive ' . escapeshellarg($pkg), false);
+            if ($result->exitCode === 0) {
+                $installed[] = $pkg;
+                $this->logger->success("Installed package: {$pkg}");
+                continue;
+            }
+
+            $reason = trim($result->stderr !== '' ? $result->stderr : $result->stdout);
+            $failed[$pkg] = $reason;
+            $this->logger->warn("Failed package: {$pkg}" . ($reason !== '' ? " | {$reason}" : ''));
         }
 
-        $cmd = 'apk add --no-interactive ' . implode(' ', array_map('escapeshellarg', $packages));
-        $this->runner->run($cmd);
-        $this->logger->success('Package installation phase completed');
+        return [
+            'installed' => $installed,
+            'failed' => $failed,
+        ];
     }
 
     private function isInstalled(string $pkg): bool
     {
         return $this->runner->run('apk info -e ' . escapeshellarg($pkg), false)->exitCode === 0;
-    }
-
-    private function existsInRepos(string $pkg): bool
-    {
-        $cmd = 'apk search -x ' . escapeshellarg($pkg);
-        $result = $this->runner->run($cmd, false);
-        if ($result->exitCode !== 0 || $result->stdout === '') {
-            return false;
-        }
-
-        $lines = preg_split('/\R+/', $result->stdout) ?: [];
-        foreach ($lines as $line) {
-            if (trim($line) === $pkg) {
-                return true;
-            }
-        }
-        return false;
     }
 }
 
@@ -556,21 +658,24 @@ final class UXValidationReport
 
 final class UXValidator
 {
+    /**
+     * @param array<string,mixed> $generated
+     */
     public function validate(array $generated): UXValidationReport
     {
         $passes = [];
         $warnings = [];
         $issues = [];
 
-        $fontSize = $generated['font_size'] ?? 11;
+        $fontSize = (int) ($generated['font_size'] ?? 11);
         if ($fontSize >= 10 && $fontSize <= 14) {
             $passes[] = "Default font size {$fontSize}pt is readable";
         } else {
             $issues[] = "Default font size {$fontSize}pt is outside conservative readable range";
         }
 
-        $fg = $generated['foreground'] ?? '#e5e7eb';
-        $bg = $generated['background'] ?? '#1f2937';
+        $fg = (string) ($generated['foreground'] ?? '#e5e7eb');
+        $bg = (string) ($generated['background'] ?? '#1f2937');
         $ratio = $this->contrastRatio($fg, $bg);
         if ($ratio >= 7.0) {
             $passes[] = sprintf('Terminal/launcher contrast ratio %.2f is strong', $ratio);
@@ -580,7 +685,7 @@ final class UXValidator
             $issues[] = sprintf('Contrast ratio %.2f is too weak', $ratio);
         }
 
-        if (($generated['rofi_shortcut'] ?? '') === 'Mod4-d') {
+        if (($generated['launcher_shortcut'] ?? '') === 'Mod4-d') {
             $passes[] = 'Launcher shortcut is practical and discoverable';
         } else {
             $warnings[] = 'Launcher shortcut differs from expected practical default';
@@ -592,16 +697,17 @@ final class UXValidator
             $warnings[] = 'Terminal shortcut differs from expected practical default';
         }
 
-        if (($generated['notification_timeout'] ?? 0) >= 5000) {
-            $passes[] = 'Notification timeout is comfortable for normal reading';
+        if ((int) ($generated['notification_timeout'] ?? 0) >= 5000) {
+            $passes[] = 'Notification timeout is comfortable for reading';
         } else {
             $warnings[] = 'Notification timeout may be too short';
         }
 
-        if (($generated['session_components'] ?? []) === []) {
-            $issues[] = 'Session startup components list is empty';
+        $sessionComponents = $generated['session_components'] ?? [];
+        if (!is_array($sessionComponents) || $sessionComponents === []) {
+            $issues[] = 'Session startup component list is empty';
         } else {
-            $passes[] = 'Session startup flow includes expected desktop helpers';
+            $passes[] = 'Session startup flow includes expected helpers';
         }
 
         if (($generated['theme_noise'] ?? 'low') === 'low') {
@@ -617,9 +723,15 @@ final class UXValidator
         }
 
         if (($generated['immediate_usability'] ?? false) === true) {
-            $passes[] = 'Environment should be usable without immediate manual edits';
+            $passes[] = 'Environment should be usable without immediate repair';
         } else {
             $issues[] = 'Environment may require immediate manual repair';
+        }
+
+        if (($generated['session_flow_ok'] ?? false) === true) {
+            $passes[] = 'Session flow is coherent: .xinitrc starts herbstluftwm directly';
+        } else {
+            $issues[] = 'Session flow is not coherent';
         }
 
         return new UXValidationReport($passes, $warnings, $issues);
@@ -637,11 +749,13 @@ final class UXValidator
     private function relativeLuminance(string $hex): float
     {
         [$r, $g, $b] = $this->hexToRgb($hex);
-        $f = function (float $c): float {
+
+        $transform = static function (float $c): float {
             $c /= 255.0;
             return $c <= 0.03928 ? $c / 12.92 : (($c + 0.055) / 1.055) ** 2.4;
         };
-        return 0.2126 * $f($r) + 0.7152 * $f($g) + 0.0722 * $f($b);
+
+        return 0.2126 * $transform($r) + 0.7152 * $transform($g) + 0.0722 * $transform($b);
     }
 
     /**
@@ -650,9 +764,11 @@ final class UXValidator
     private function hexToRgb(string $hex): array
     {
         $hex = ltrim(trim($hex), '#');
-        if (strlen($hex) !== 6 || !ctype_xdigit($hex)) {
+
+        if (!preg_match('/^[0-9A-Fa-f]{6}$/', $hex)) {
             return [229, 231, 235];
         }
+
         return [
             hexdec(substr($hex, 0, 2)),
             hexdec(substr($hex, 2, 2)),
@@ -703,40 +819,33 @@ final class Provisioner
         $this->report->addCompleted('Refreshed apk indexes');
 
         $this->progress->phase('Package planning');
-        [$installable, $missing, $alreadyInstalled] = $this->planPackages();
-
+        [$installable, $alreadyInstalled] = $this->planPackages();
         foreach ($alreadyInstalled as $pkg) {
             $this->report->addSkipped("Already installed: {$pkg}");
         }
-        foreach ($missing as $pkg) {
-            $this->report->addIssue("Package not available in configured repositories: {$pkg}");
-        }
 
         $this->progress->phase('Package installation');
-        $this->packageManager->install($installable);
-        foreach ($installable as $pkg) {
+        $installResult = $this->packageManager->install($installable);
+        foreach ($installResult['installed'] as $pkg) {
             $this->report->addCompleted("Installed package: {$pkg}");
         }
+        foreach ($installResult['failed'] as $pkg => $reason) {
+            $this->report->addIssue("Failed package: {$pkg}" . ($reason !== '' ? " | {$reason}" : ''));
+        }
+
+        $this->progress->phase('Runtime command validation');
+        $runtime = $this->determineRuntimeCommands();
 
         $this->progress->phase('Directory staging');
         $this->createUserDirs($user);
 
         $this->progress->phase('Desktop configuration generation');
-        $generated = $this->writeConfigs($user);
+        $generated = $this->writeConfigs($user, $runtime);
 
-        $this->progress->phase('Session validation and UX/UI validation');
+        $this->progress->phase('Session and UX/UI validation');
         $validation = $this->validator->validate($generated);
         $this->writeValidationReport($user, $validation);
-
-        foreach ($validation->passes as $pass) {
-            $this->report->addCompleted("UX pass: {$pass}");
-        }
-        foreach ($validation->warnings as $warning) {
-            $this->report->addIssue("UX warning: {$warning}");
-        }
-        foreach ($validation->issues as $issue) {
-            $this->report->addIssue("UX issue: {$issue}");
-        }
+        $this->ingestValidation($validation);
 
         $this->progress->phase('Final summary');
         $this->finalize($user, $validation);
@@ -747,40 +856,45 @@ final class Provisioner
     private function validatePreflight(EnvironmentState $state, UserTarget $user): void
     {
         if (!$state->isAlpine) {
-            throw new CliException('Unsupported system: this script targets Alpine Linux only.', ExitCode::UNSUPPORTED);
+            throw new CliException('Unsupported system: alpine-lapaz targets Alpine Linux only.', ExitCode::UNSUPPORTED);
         }
+
         if (!$state->isRoot) {
             throw new CliException('Root privileges are required.', ExitCode::PRIVILEGE);
         }
+
         if (!$state->apkAvailable) {
             throw new CliException('apk package manager not found.', ExitCode::PREFLIGHT);
         }
+
         if (!$state->reposReadable) {
             throw new CliException('/etc/apk/repositories is not readable.', ExitCode::PREFLIGHT);
         }
+
         if (!$state->networkOk) {
-            throw new CliException('Network access test failed; repository operations would be unsafe.', ExitCode::NETWORK);
+            throw new CliException('Network access test failed; package operations would be unsafe.', ExitCode::NETWORK);
         }
+
+        $this->detector->assertRepositorySanity();
+
+        if (!$state->mainRepoOk) {
+            throw new CliException('Main repository probe failed.', ExitCode::PREFLIGHT);
+        }
+
+        if (!$state->communityRepoOk) {
+            throw new CliException('Community repository probe failed.', ExitCode::PREFLIGHT);
+        }
+
         if (!is_dir($user->home) || !is_writable($user->home)) {
             throw new CliException("Target user home is not writable: {$user->home}", ExitCode::PREFLIGHT);
         }
 
-        $this->logger->success("Environment validated for Alpine Linux");
+        $this->logger->success('Environment validated for Alpine Linux');
         $this->logger->info("Target desktop user: {$user->username} ({$user->home})");
-
-        if ($state->xorgInstalled) {
-            $this->report->addNote('X11 components were already partially present');
-        }
-        if ($state->herbstInstalled) {
-            $this->report->addNote('herbstluftwm was already installed');
-        }
-        if ($state->rofiInstalled) {
-            $this->report->addNote('rofi was already installed');
-        }
     }
 
     /**
-     * @return array{0:string[],1:string[],2:string[]}
+     * @return array{0:string[],1:string[]}
      */
     private function planPackages(): array
     {
@@ -800,12 +914,9 @@ final class Provisioner
             'dunst',
             'feh',
             'picom',
-
             'alacritty',
-            'font-dejavu',
-            'ttf-dejavu',
-            'noto-fonts',
 
+            'font-dejavu',
             'pcmanfm',
             'xclip',
             'maim',
@@ -827,7 +938,41 @@ final class Provisioner
         ];
 
         $resolved = $this->packageManager->resolvePackages($requested);
-        return [$resolved['installable'], $resolved['missing'], $resolved['alreadyInstalled']];
+        return [$resolved['installable'], $resolved['alreadyInstalled']];
+    }
+
+    /**
+     * @return array<string,string|bool>
+     */
+    private function determineRuntimeCommands(): array
+    {
+        $required = ['herbstluftwm', 'herbstclient', 'rofi'];
+        foreach ($required as $cmd) {
+            if (!$this->runner->exists($cmd)) {
+                throw new CliException("Required runtime command missing after installation: {$cmd}", ExitCode::PACKAGE);
+            }
+        }
+
+        $terminal = $this->runner->firstExisting(['alacritty', 'xterm']);
+        if ($terminal === null) {
+            throw new CliException('No usable terminal command found after installation.', ExitCode::PACKAGE);
+        }
+
+        $fileManager = $this->runner->firstExisting(['pcmanfm', 'thunar', 'xdg-open']) ?? 'xdg-open';
+
+        $hasScreenshotStack = $this->runner->exists('maim')
+            && $this->runner->exists('slop')
+            && $this->runner->exists('xclip');
+
+        if (!$hasScreenshotStack) {
+            $this->report->addIssue('Screenshot stack is incomplete; screenshot keybindings will be omitted.');
+        }
+
+        return [
+            'terminal' => $terminal,
+            'file_manager' => $fileManager,
+            'has_screenshot_stack' => $hasScreenshotStack,
+        ];
     }
 
     private function createUserDirs(UserTarget $user): void
@@ -851,21 +996,36 @@ final class Provisioner
         }
     }
 
-    private function writeConfigs(UserTarget $user): array
+    /**
+     * @param array<string,string|bool> $runtime
+     * @return array<string,mixed>
+     */
+    private function writeConfigs(UserTarget $user, array $runtime): array
     {
-        $bg = '#1f2937';
-        $fg = '#e5e7eb';
+        $background = '#1f2937';
+        $foreground = '#e5e7eb';
         $accent = '#94a3b8';
         $font = 'DejaVu Sans Mono';
         $fontSize = 11;
 
-        $autostart = $this->buildHerbstAutostart($bg, $fg, $accent);
-        $rofi = $this->buildRofiConfig($bg, $fg, $accent);
-        $dunst = $this->buildDunstConfig($bg, $fg, $accent, $font, $fontSize);
-        $alacritty = $this->buildAlacrittyConfig($bg, $fg, $font, $fontSize);
-        $xresources = $this->buildXresources($bg, $fg, $accent, $font, $fontSize);
+        $terminal = (string) $runtime['terminal'];
+        $fileManager = (string) $runtime['file_manager'];
+        $hasScreenshotStack = (bool) $runtime['has_screenshot_stack'];
+
+        $autostart = $this->buildHerbstAutostart(
+            $background,
+            $accent,
+            $terminal,
+            $fileManager,
+            $hasScreenshotStack
+        );
+
+        $rofi = $this->buildRofiConfig($background, $foreground, $accent);
+        $dunst = $this->buildDunstConfig($background, $foreground, $accent, $font, $fontSize);
+        $alacritty = $this->buildAlacrittyConfig($background, $foreground, $font, $fontSize);
+        $xresources = $this->buildXresources($background, $foreground, $font);
         $xinitrc = $this->buildXinitrc();
-        $readme = $this->buildDesktopHelp();
+        $readme = $this->buildDesktopHelp($terminal, $fileManager, $hasScreenshotStack);
 
         $writes = [
             [$user->home . '/.config/herbstluftwm/autostart', $autostart, 0755],
@@ -887,42 +1047,56 @@ final class Provisioner
         }
 
         return [
-            'background' => $bg,
-            'foreground' => $fg,
+            'background' => $background,
+            'foreground' => $foreground,
             'font_size' => $fontSize,
-            'rofi_shortcut' => 'Mod4-d',
+            'launcher_shortcut' => 'Mod4-d',
             'terminal_shortcut' => 'Mod4-Return',
             'notification_timeout' => 6000,
-            'session_components' => ['dbus', 'feh', 'dunst', 'picom', 'herbstluftwm'],
+            'session_components' => ['dbus', 'dunst', 'picom', 'feh', 'pipewire', 'wireplumber'],
             'theme_noise' => 'low',
             'keybindings_documented' => true,
             'immediate_usability' => true,
+            'session_flow_ok' => true,
         ];
     }
 
-    private function buildHerbstAutostart(string $bg, string $fg, string $accent): string
-    {
+    private function buildHerbstAutostart(
+        string $background,
+        string $accent,
+        string $terminal,
+        string $fileManager,
+        bool $hasScreenshotStack
+    ): string {
+        $screenshotKeys = '';
+        if ($hasScreenshotStack) {
+            $screenshotKeys = <<<SH
+
+hc keybind \$Mod-Print spawn sh -c 'maim | xclip -selection clipboard -t image/png'
+hc keybind \$Mod-Shift-s spawn sh -c 'maim -s | xclip -selection clipboard -t image/png'
+SH;
+        }
+
         return <<<SH
 #!/bin/sh
 set -eu
 
 export XDG_CURRENT_DESKTOP=herbstluftwm
 export XDG_SESSION_TYPE=x11
-export GTK_THEME=Adwaita:dark
-export QT_QPA_PLATFORMTHEME=gtk2
-export TERMINAL=alacritty
-export BROWSER=firefox
+export TERMINAL={$terminal}
+
+hc() { herbstclient "\$@"; }
 
 if command -v xrdb >/dev/null 2>&1 && [ -f "\$HOME/.Xresources" ]; then
     xrdb -merge "\$HOME/.Xresources"
 fi
 
 if command -v xsetroot >/dev/null 2>&1; then
-    xsetroot -cursor_name left_ptr -solid "{$bg}"
+    xsetroot -cursor_name left_ptr -solid "{$background}"
 fi
 
 if command -v dbus-update-activation-environment >/dev/null 2>&1; then
-    dbus-update-activation-environment --systemd DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE || true
+    dbus-update-activation-environment DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE >/dev/null 2>&1 || true
 fi
 
 if command -v pipewire >/dev/null 2>&1 && ! pgrep -u "\$(id -u)" -x pipewire >/dev/null 2>&1; then
@@ -948,32 +1122,26 @@ fi
 if command -v feh >/dev/null 2>&1; then
     if [ -f "\$HOME/.local/share/backgrounds/default-desktop-bg.png" ]; then
         feh --no-fehbg --bg-fill "\$HOME/.local/share/backgrounds/default-desktop-bg.png" >/dev/null 2>&1 || true
-    else
-        feh --no-fehbg --bg-fill /usr/share/backgrounds/* >/dev/null 2>&1 || true
     fi
 fi
 
-hc() { herbstclient "\$@" ; }
-
 hc emit_hook reload
-
-Mod=Mod4
-
 hc keyunbind --all
 hc mouseunbind --all
 hc unrule -F
 
+Mod=Mod4
+
 hc set frame_border_active_color "{$accent}"
 hc set frame_border_normal_color "#4b5563"
-hc set frame_bg_normal_color "{$bg}"
-hc set frame_bg_active_color "{$bg}"
+hc set frame_bg_normal_color "{$background}"
+hc set frame_bg_active_color "{$background}"
 hc set frame_border_width 2
 hc set window_border_width 2
 hc set frame_gap 8
 hc set window_gap 0
 hc set smart_window_surroundings 1
 hc set smart_frame_surroundings 1
-hc set mouse_recenter_gap 0
 hc set snap_gap 8
 hc set focus_follows_mouse off
 hc set tree_style '╾│ ├└╼─┐'
@@ -987,15 +1155,19 @@ done
 hc rename default main || true
 hc use main
 
-hc keybind \$Mod-Return spawn alacritty
+hc keybind \$Mod-Return spawn {$terminal}
 hc keybind \$Mod-d spawn rofi -show drun
+hc keybind \$Mod-c spawn {$fileManager}
 hc keybind \$Mod-Shift-q close
 hc keybind \$Mod-q quit
 hc keybind \$Mod-Shift-r reload
-hc keybind \$Mod-c spawn pcmanfm
-hc keybind \$Mod-Shift-s spawn "maim -s | xclip -selection clipboard -t image/png"
-hc keybind \$Mod-Print spawn "maim | xclip -selection clipboard -t image/png"
-hc keybind \$Mod-Shift-c spawn "pkill -x picom || picom --config /dev/null --backend xrender --vsync >/dev/null 2>&1 &"
+hc keybind \$Mod-space cycle_layout +1
+hc keybind \$Mod-f fullscreen toggle
+hc keybind \$Mod-p pseudotile toggle
+hc keybind \$Mod-s floating toggle
+hc keybind \$Mod-Tab cycle_monitor
+hc keybind \$Mod-period cycle_all +1
+hc keybind \$Mod-comma cycle_all -1{$screenshotKeys}
 
 hc keybind \$Mod-Left focus left
 hc keybind \$Mod-Down focus down
@@ -1012,14 +1184,6 @@ hc keybind \$Mod-Control-Down resize down +0.05
 hc keybind \$Mod-Control-Up resize up +0.05
 hc keybind \$Mod-Control-Right resize right +0.05
 
-hc keybind \$Mod-space cycle_layout +1
-hc keybind \$Mod-f fullscreen toggle
-hc keybind \$Mod-p pseudotile toggle
-hc keybind \$Mod-s floating toggle
-hc keybind \$Mod-Tab cycle_monitor
-hc keybind \$Mod-period cycle_all +1
-hc keybind \$Mod-comma cycle_all -1
-
 hc mousebind \$Mod-Button1 move
 hc mousebind \$Mod-Button2 zoom
 hc mousebind \$Mod-Button3 resize
@@ -1028,12 +1192,10 @@ hc rule focus=on
 hc rule windowtype~'_NET_WM_WINDOW_TYPE_(DIALOG|UTILITY|SPLASH)' floating=on
 hc rule class='Pavucontrol' floating=on
 hc rule class='feh' floating=on
-
-exec herbstluftwm
 SH;
     }
 
-    private function buildRofiConfig(string $bg, string $fg, string $accent): string
+    private function buildRofiConfig(string $background, string $foreground, string $accent): string
     {
         return <<<RASI
 configuration {
@@ -1044,16 +1206,15 @@ configuration {
     display-window: "Windows";
     drun-display-format: "{name}";
     font: "DejaVu Sans 11";
-    location: 0;
     disable-history: false;
-    sidebar-mode: false;
     hover-select: true;
+    sidebar-mode: false;
 }
 
 * {
-    background: {$bg};
+    background: {$background};
     background-alt: #111827;
-    foreground: {$fg};
+    foreground: {$foreground};
     selected: {$accent};
     urgent: #b45309;
     border-color: #4b5563;
@@ -1120,8 +1281,13 @@ element-text, element-icon {
 RASI;
     }
 
-    private function buildDunstConfig(string $bg, string $fg, string $accent, string $font, int $fontSize): string
-    {
+    private function buildDunstConfig(
+        string $background,
+        string $foreground,
+        string $accent,
+        string $font,
+        int $fontSize
+    ): string {
         return <<<INI
 [global]
     monitor = 0
@@ -1134,9 +1300,6 @@ RASI;
     notification_limit = 6
     progress_bar = true
     progress_bar_height = 10
-    progress_bar_frame_width = 1
-    progress_bar_min_width = 150
-    progress_bar_max_width = 300
     indicate_hidden = yes
     transparency = 0
     separator_height = 2
@@ -1153,9 +1316,7 @@ RASI;
     markup = full
     format = "<b>%s</b>\\n%b"
     alignment = left
-    vertical_alignment = center
     word_wrap = yes
-    show_age_threshold = 60
     ellipsize = middle
     stack_duplicates = true
     hide_duplicate_count = false
@@ -1166,20 +1327,16 @@ RASI;
     sticky_history = yes
     history_length = 20
     browser = /usr/bin/xdg-open
-    always_run_script = true
-    title = Dunst
-    class = Dunst
     corner_radius = 6
-    ignore_dbusclose = false
 
 [urgency_low]
-    background = "{$bg}"
-    foreground = "{$fg}"
+    background = "{$background}"
+    foreground = "{$foreground}"
     timeout = 6
 
 [urgency_normal]
-    background = "{$bg}"
-    foreground = "{$fg}"
+    background = "{$background}"
+    foreground = "{$foreground}"
     timeout = 6
 
 [urgency_critical]
@@ -1190,8 +1347,12 @@ RASI;
 INI;
     }
 
-    private function buildAlacrittyConfig(string $bg, string $fg, string $font, int $fontSize): string
-    {
+    private function buildAlacrittyConfig(
+        string $background,
+        string $foreground,
+        string $font,
+        int $fontSize
+    ): string {
         return <<<TOML
 [window]
 padding = { x = 10, y = 10 }
@@ -1205,12 +1366,12 @@ italic = { family = "{$font}", style = "Italic" }
 size = {$fontSize}
 
 [colors.primary]
-background = "{$bg}"
-foreground = "{$fg}"
+background = "{$background}"
+foreground = "{$foreground}"
 
 [colors.cursor]
-text = "{$bg}"
-cursor = "{$fg}"
+text = "{$background}"
+cursor = "{$foreground}"
 
 [colors.normal]
 black = "#111827"
@@ -1234,31 +1395,15 @@ white = "#f3f4f6"
 TOML;
     }
 
-    private function buildXresources(string $bg, string $fg, string $accent, string $font, int $fontSize): string
+    private function buildXresources(string $background, string $foreground, string $font): string
     {
         return <<<XRDB
 Xcursor.size: 24
 Xcursor.theme: Adwaita
 *.font: xft:{$font}:pixelsize=15:antialias=true:hinting=true
-*.foreground: {$fg}
-*.background: {$bg}
-*.cursorColor: {$fg}
-*.color0: #111827
-*.color1: #7f1d1d
-*.color2: #166534
-*.color3: #92400e
-*.color4: #1d4ed8
-*.color5: #6b21a8
-*.color6: #155e75
-*.color7: #d1d5db
-*.color8: #374151
-*.color9: #b91c1c
-*.color10: #15803d
-*.color11: #b45309
-*.color12: #2563eb
-*.color13: #7e22ce
-*.color14: #0f766e
-*.color15: #f3f4f6
+*.foreground: {$foreground}
+*.background: {$background}
+*.cursorColor: {$foreground}
 XRDB;
     }
 
@@ -1271,30 +1416,37 @@ set -eu
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=herbstluftwm
 export XDG_SESSION_DESKTOP=herbstluftwm
-export GTK_USE_PORTAL=0
 
-if command -v dbus-launch >/dev/null 2>&1; then
-    eval "$(dbus-launch --sh-syntax --exit-with-session)"
+if command -v elogind-launch >/dev/null 2>&1 && command -v dbus-launch >/dev/null 2>&1; then
+    exec elogind-launch dbus-launch --exit-with-session herbstluftwm
 fi
 
 if command -v elogind-launch >/dev/null 2>&1; then
-    exec elogind-launch sh -lc "$HOME/.config/herbstluftwm/autostart"
+    exec elogind-launch herbstluftwm
 fi
 
-exec sh -lc "$HOME/.config/herbstluftwm/autostart"
+if command -v dbus-launch >/dev/null 2>&1; then
+    exec dbus-launch --exit-with-session herbstluftwm
+fi
+
+exec herbstluftwm
 SH;
     }
 
-    private function buildDesktopHelp(): string
+    private function buildDesktopHelp(string $terminal, string $fileManager, bool $hasScreenshotStack): string
     {
+        $screenshotLines = $hasScreenshotStack
+            ? "Super + Print         Full screenshot to clipboard\nSuper + Shift + s     Selection screenshot to clipboard\n"
+            : "Screenshot shortcuts are disabled because screenshot utilities were not fully available.\n";
+
         return <<<TXT
 alpine-lapaz desktop provisioner
 
 Daily-use shortcuts
 -------------------
-Super + Enter         Open terminal
+Super + Enter         Open terminal ({$terminal})
 Super + d             Open launcher (rofi)
-Super + c             Open file manager
+Super + c             Open file manager ({$fileManager})
 Super + Shift + q     Close focused window
 Super + Shift + r     Reload herbstluftwm config
 Super + s             Toggle floating for focused window
@@ -1305,9 +1457,7 @@ Super + Shift + 1..9  Move window to workspace
 Super + Arrow keys    Focus neighboring window
 Super + Shift + Arrow keys  Move window
 Super + Ctrl + Arrow keys   Resize split
-Super + Print         Full screenshot to clipboard
-Super + Shift + s     Selection screenshot to clipboard
-
+{$screenshotLines}
 Startup
 -------
 Run: startx
@@ -1321,33 +1471,41 @@ Design choices
 - practical default bindings
 - restrained notifications
 
-If you later want deeper customization, first copy the current configuration
-and preserve readability and contrast.
+Project paths
+-------------
+- log directory: /var/log/alpine-lapaz
+- backup directory: /var/backups/alpine-lapaz
+- user report directory: ~/.config/alpine-lapaz
 TXT;
     }
 
     private function writeValidationReport(UserTarget $user, UXValidationReport $validation): void
     {
-        $lines = [];
-        $lines[] = "UX/UI validation report";
-        $lines[] = "Generated at: " . date('c');
-        $lines[] = "";
-        $lines[] = "Passes:";
+        $lines = [
+            'UX/UI validation report',
+            'Generated at: ' . date('c'),
+            '',
+            'Passes:',
+        ];
+
         foreach ($validation->passes as $item) {
-            $lines[] = "  - {$item}";
+            $lines[] = '  - ' . $item;
         }
-        $lines[] = "";
-        $lines[] = "Warnings:";
+
+        $lines[] = '';
+        $lines[] = 'Warnings:';
         foreach ($validation->warnings as $item) {
-            $lines[] = "  - {$item}";
+            $lines[] = '  - ' . $item;
         }
-        $lines[] = "";
-        $lines[] = "Issues:";
+
+        $lines[] = '';
+        $lines[] = 'Issues:';
         foreach ($validation->issues as $item) {
-            $lines[] = "  - {$item}";
+            $lines[] = '  - ' . $item;
         }
-        $lines[] = "";
-        $lines[] = "Outcome: " . ($validation->isAcceptable() ? "ACCEPTABLE" : "NEEDS REVIEW");
+
+        $lines[] = '';
+        $lines[] = 'Outcome: ' . ($validation->isAcceptable() ? 'ACCEPTABLE' : 'NEEDS REVIEW');
 
         $this->files->writeAtomic(
             $user->home . '/.config/alpine-lapaz/ux-validation-report.txt',
@@ -1358,9 +1516,23 @@ TXT;
         );
     }
 
+    private function ingestValidation(UXValidationReport $validation): void
+    {
+        foreach ($validation->passes as $pass) {
+            $this->report->addCompleted("UX pass: {$pass}");
+        }
+        foreach ($validation->warnings as $warning) {
+            $this->report->addIssue("UX warning: {$warning}");
+        }
+        foreach ($validation->issues as $issue) {
+            $this->report->addIssue("UX issue: {$issue}");
+        }
+    }
+
     private function finalize(UserTarget $user, UXValidationReport $validation): void
     {
         $this->logger->success('Provisioning completed');
+
         fwrite(STDOUT, "\n" . Ansi::BOLD . "Summary" . Ansi::RESET . "\n");
         fwrite(STDOUT, "-------\n");
 
@@ -1381,14 +1553,13 @@ TXT;
         fwrite(STDOUT, "Persistent log file: " . $this->logger->path() . "\n");
         fwrite(STDOUT, "UX/UI report: " . $user->home . "/.config/alpine-lapaz/ux-validation-report.txt\n");
         fwrite(STDOUT, "Quick help: " . $user->home . "/.config/alpine-lapaz/README.txt\n");
-
         fwrite(STDOUT, "\nManual next step:\n");
         fwrite(STDOUT, "  Log in as {$user->username} and run: startx\n");
 
-        if (!$validation->isAcceptable()) {
-            fwrite(STDOUT, Ansi::YELLOW . "\nProvisioning finished with UX/UI review notes.\n" . Ansi::RESET);
-        } else {
+        if ($validation->isAcceptable()) {
             fwrite(STDOUT, Ansi::GREEN . "\nProvisioning finished successfully with acceptable UX/UI validation.\n" . Ansi::RESET);
+        } else {
+            fwrite(STDOUT, Ansi::YELLOW . "\nProvisioning finished with UX/UI review notes.\n" . Ansi::RESET);
         }
     }
 }
@@ -1408,6 +1579,7 @@ Notes:
   - Target system must be Alpine Linux
   - If multiple non-root desktop users exist, --user is required
 TXT;
+
     fwrite(STDOUT, $msg . "\n");
     exit(ExitCode::USAGE);
 }
@@ -1420,6 +1592,7 @@ function main(array $argv): int
         if ($arg === '--help' || $arg === '-h') {
             usage();
         }
+
         if (str_starts_with($arg, '--user=')) {
             $requestedUser = substr($arg, 7);
             if ($requestedUser === '') {
@@ -1427,6 +1600,7 @@ function main(array $argv): int
             }
             continue;
         }
+
         throw new CliException("Unknown argument: {$arg}", ExitCode::USAGE);
     }
 
@@ -1435,7 +1609,7 @@ function main(array $argv): int
     $transactionDir = "/var/backups/alpine-lapaz/txn-{$timestamp}";
 
     $logger = new Logger($logFile);
-    $progress = new ProgressRenderer(7, $logger);
+    $progress = new ProgressRenderer(9, $logger);
     $runner = new CommandRunner($logger);
     $backupManager = new BackupManager($transactionDir, $logger);
     $fileManager = new FileManager($logger, $backupManager);
