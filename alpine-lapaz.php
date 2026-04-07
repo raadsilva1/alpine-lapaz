@@ -181,6 +181,9 @@ final class CommandRunner
         return $this->run('command -v ' . escapeshellarg($binary) . ' >/dev/null 2>&1', false)->exitCode === 0;
     }
 
+    /**
+     * @param string[] $commands
+     */
     public function firstExisting(array $commands): ?string
     {
         foreach ($commands as $cmd) {
@@ -255,12 +258,6 @@ final class BackupManager
     {
         return $this->transactionDir;
     }
-
-    /** @return array<string,string> */
-    public function list(): array
-    {
-        return $this->backups;
-    }
 }
 
 final class FileManager
@@ -277,7 +274,6 @@ final class FileManager
         }
 
         @chmod($path, $mode);
-
         if ($uid !== null) {
             @chown($path, $uid);
         }
@@ -342,10 +338,9 @@ final class EnvironmentState
         public readonly bool $isAlpine,
         public readonly bool $isRoot,
         public readonly bool $apkAvailable,
+        public readonly bool $openrcAvailable,
         public readonly bool $networkOk,
         public readonly bool $reposReadable,
-        public readonly bool $mainRepoOk,
-        public readonly bool $communityRepoOk,
         public readonly array $candidateUsers
     ) {}
 }
@@ -368,9 +363,9 @@ final class EnvironmentDetector
             : trim((string) shell_exec('id -u')) === '0';
 
         $apkAvailable = $this->runner->exists('apk');
+        $openrcAvailable = $this->runner->exists('rc-update') && $this->runner->exists('rc-service');
         $reposReadable = is_readable('/etc/apk/repositories');
         $networkOk = $this->checkNetwork();
-        [$mainRepoOk, $communityRepoOk] = $this->probeRepositories();
 
         $users = $this->detectUsers();
         $target = $this->selectUser($requestedUser, $users);
@@ -380,10 +375,9 @@ final class EnvironmentDetector
                 $isAlpine,
                 $isRoot,
                 $apkAvailable,
+                $openrcAvailable,
                 $networkOk,
                 $reposReadable,
-                $mainRepoOk,
-                $communityRepoOk,
                 $users
             ),
             $target
@@ -434,19 +428,19 @@ final class EnvironmentDetector
 
         if (!$hasNetworkMirror) {
             throw new CliException(
-                'Repositories appear to point only to local/install media paths. Configure normal Alpine mirrors first.',
+                'Repositories appear to point only to local/install media paths. Configure Alpine mirror URLs first.',
                 ExitCode::PREFLIGHT
             );
         }
 
         $mainProbe = $this->runner->run('apk search -x alsa-utils', false);
         if (!$this->apkSearchContainsPackage($mainProbe->stdout, 'alsa-utils')) {
-            throw new CliException('Main repository probe failed for alsa-utils.', ExitCode::PREFLIGHT);
+            throw new CliException('Main repository probe failed for alsa-utils after apk update.', ExitCode::PREFLIGHT);
         }
 
         $communityProbe = $this->runner->run('apk search -x rofi', false);
         if (!$this->apkSearchContainsPackage($communityProbe->stdout, 'rofi')) {
-            throw new CliException('Community repository probe failed for rofi.', ExitCode::PREFLIGHT);
+            throw new CliException('Community repository probe failed for rofi after apk update.', ExitCode::PREFLIGHT);
         }
     }
 
@@ -464,20 +458,6 @@ final class EnvironmentDetector
         }
 
         return false;
-    }
-
-    /**
-     * @return array{0:bool,1:bool}
-     */
-    private function probeRepositories(): array
-    {
-        $main = $this->runner->run('apk search -x alsa-utils', false);
-        $community = $this->runner->run('apk search -x rofi', false);
-
-        return [
-            $this->apkSearchContainsPackage($main->stdout, 'alsa-utils'),
-            $this->apkSearchContainsPackage($community->stdout, 'rofi'),
-        ];
     }
 
     private function apkSearchContainsPackage(string $stdout, string $package): bool
@@ -614,6 +594,7 @@ final class PackageManager
 
         foreach ($packages as $pkg) {
             $result = $this->runner->run('apk add --no-interactive ' . escapeshellarg($pkg), false);
+
             if ($result->exitCode === 0) {
                 $installed[] = $pkg;
                 $this->logger->success("Installed package: {$pkg}");
@@ -729,7 +710,7 @@ final class UXValidator
         }
 
         if (($generated['session_flow_ok'] ?? false) === true) {
-            $passes[] = 'Session flow is coherent: .xinitrc starts herbstluftwm directly';
+            $passes[] = 'Session flow is coherent: .xinitrc launches herbstluftwm directly';
         } else {
             $issues[] = 'Session flow is not coherent';
         }
@@ -818,6 +799,10 @@ final class Provisioner
         $this->packageManager->refreshIndexes();
         $this->report->addCompleted('Refreshed apk indexes');
 
+        $this->progress->phase('Repository sanity validation');
+        $this->detector->assertRepositorySanity();
+        $this->report->addCompleted('Validated main/community repositories after apk update');
+
         $this->progress->phase('Package planning');
         [$installable, $alreadyInstalled] = $this->planPackages();
         foreach ($alreadyInstalled as $pkg) {
@@ -832,6 +817,12 @@ final class Provisioner
         foreach ($installResult['failed'] as $pkg => $reason) {
             $this->report->addIssue("Failed package: {$pkg}" . ($reason !== '' ? " | {$reason}" : ''));
         }
+
+        $this->progress->phase('Device manager and service setup');
+        $this->configureSystemIntegration();
+
+        $this->progress->phase('Target user group setup');
+        $this->ensureDesktopGroups($user);
 
         $this->progress->phase('Runtime command validation');
         $runtime = $this->determineRuntimeCommands();
@@ -867,22 +858,16 @@ final class Provisioner
             throw new CliException('apk package manager not found.', ExitCode::PREFLIGHT);
         }
 
+        if (!$state->openrcAvailable) {
+            throw new CliException('OpenRC tools (rc-update/rc-service) are required.', ExitCode::PREFLIGHT);
+        }
+
         if (!$state->reposReadable) {
             throw new CliException('/etc/apk/repositories is not readable.', ExitCode::PREFLIGHT);
         }
 
         if (!$state->networkOk) {
             throw new CliException('Network access test failed; package operations would be unsafe.', ExitCode::NETWORK);
-        }
-
-        $this->detector->assertRepositorySanity();
-
-        if (!$state->mainRepoOk) {
-            throw new CliException('Main repository probe failed.', ExitCode::PREFLIGHT);
-        }
-
-        if (!$state->communityRepoOk) {
-            throw new CliException('Community repository probe failed.', ExitCode::PREFLIGHT);
         }
 
         if (!is_dir($user->home) || !is_writable($user->home)) {
@@ -899,28 +884,41 @@ final class Provisioner
     private function planPackages(): array
     {
         $requested = [
+            'alpine-conf',
+
             'xorg-server',
             'xinit',
             'xf86-input-libinput',
             'xrandr',
             'xsetroot',
             'xauth',
+
+            'eudev',
+            'eudev-openrc',
+
             'dbus',
+            'dbus-x11',
+            'dbus-openrc',
+
             'elogind',
-            'polkit',
+            'elogind-openrc',
+            'polkit-elogind',
 
             'herbstluftwm',
             'rofi',
             'dunst',
             'feh',
             'picom',
+
             'alacritty',
+            'xterm',
 
             'font-dejavu',
             'pcmanfm',
             'xclip',
             'maim',
             'slop',
+            'xdg-utils',
             'unzip',
             'zip',
             'p7zip',
@@ -941,13 +939,120 @@ final class Provisioner
         return [$resolved['installable'], $resolved['alreadyInstalled']];
     }
 
+    private function configureSystemIntegration(): void
+    {
+        $configuredEudev = false;
+
+        if ($this->runner->exists('setup-devd')) {
+            $res = $this->runner->run('setup-devd udev', false);
+            if ($res->exitCode === 0) {
+                $configuredEudev = true;
+                $this->report->addCompleted('Configured eudev via setup-devd udev');
+            } else {
+                $reason = trim($res->stderr !== '' ? $res->stderr : $res->stdout);
+                $this->report->addIssue('setup-devd udev failed' . ($reason !== '' ? " | {$reason}" : ''));
+            }
+        }
+
+        if (!$configuredEudev) {
+            $manual = [
+                'rc-update add udev sysinit',
+                'rc-update add udev-trigger sysinit',
+                'rc-update add udev-settle sysinit',
+                'rc-update add udev-postmount default',
+                'rc-service udev start',
+                'rc-service udev-trigger start',
+                'rc-service udev-settle start',
+                'rc-service udev-postmount start',
+            ];
+
+            $allOk = true;
+            foreach ($manual as $cmd) {
+                $res = $this->runner->run($cmd, false);
+                if ($res->exitCode !== 0) {
+                    $allOk = false;
+                    $reason = trim($res->stderr !== '' ? $res->stderr : $res->stdout);
+                    $this->report->addIssue("Manual eudev step failed: {$cmd}" . ($reason !== '' ? " | {$reason}" : ''));
+                }
+            }
+
+            if ($allOk) {
+                $this->report->addCompleted('Configured eudev manually through OpenRC');
+            }
+        }
+
+        $this->enableOpenRcService('dbus', 'default');
+        $this->enableOpenRcService('elogind', 'default');
+
+        $this->report->addNote('If this machine just switched from mdev to eudev, a reboot may still be required before the first stable graphical session.');
+    }
+
+    private function enableOpenRcService(string $service, string $runlevel = 'default'): void
+    {
+        $initScript = '/etc/init.d/' . $service;
+        if (!file_exists($initScript)) {
+            $this->report->addIssue("OpenRC init script not found for service: {$service}");
+            return;
+        }
+
+        $add = $this->runner->run(
+            'rc-update add ' . escapeshellarg($service) . ($runlevel !== '' ? ' ' . escapeshellarg($runlevel) : ''),
+            false
+        );
+        if ($add->exitCode === 0) {
+            $this->report->addCompleted("Enabled service: {$service}");
+        } else {
+            $reason = trim($add->stderr !== '' ? $add->stderr : $add->stdout);
+            $this->report->addIssue("Failed enabling service: {$service}" . ($reason !== '' ? " | {$reason}" : ''));
+        }
+
+        $start = $this->runner->run('rc-service ' . escapeshellarg($service) . ' start', false);
+        if ($start->exitCode === 0) {
+            $this->report->addCompleted("Started service: {$service}");
+        } else {
+            $reason = trim($start->stderr !== '' ? $start->stderr : $start->stdout);
+            $this->report->addIssue("Failed starting service: {$service}" . ($reason !== '' ? " | {$reason}" : ''));
+        }
+    }
+
+    private function ensureDesktopGroups(UserTarget $user): void
+    {
+        foreach (['input', 'video', 'audio'] as $group) {
+            $res = $this->runner->run('getent group ' . escapeshellarg($group) . ' >/dev/null 2>&1', false);
+            if ($res->exitCode !== 0) {
+                $this->report->addIssue("Group not found, skipped membership: {$group}");
+                continue;
+            }
+
+            $current = $this->runner->run('id -nG ' . escapeshellarg($user->username), false);
+            $groupList = preg_split('/\s+/', trim($current->stdout)) ?: [];
+            if (in_array($group, $groupList, true)) {
+                $this->report->addSkipped("User already in group: {$group}");
+                continue;
+            }
+
+            $add = $this->runner->run(
+                'addgroup ' . escapeshellarg($user->username) . ' ' . escapeshellarg($group),
+                false
+            );
+
+            if ($add->exitCode === 0) {
+                $this->report->addCompleted("Added {$user->username} to group: {$group}");
+            } else {
+                $reason = trim($add->stderr !== '' ? $add->stderr : $add->stdout);
+                $this->report->addIssue("Failed to add {$user->username} to group {$group}" . ($reason !== '' ? " | {$reason}" : ''));
+            }
+        }
+
+        $this->report->addNote('If group memberships changed, the target user should fully log out before trying startx again.');
+    }
+
     /**
      * @return array<string,string|bool>
      */
     private function determineRuntimeCommands(): array
     {
-        $required = ['herbstluftwm', 'herbstclient', 'rofi'];
-        foreach ($required as $cmd) {
+        foreach (['herbstluftwm', 'herbstclient', 'rofi'] as $cmd) {
             if (!$this->runner->exists($cmd)) {
                 throw new CliException("Required runtime command missing after installation: {$cmd}", ExitCode::PACKAGE);
             }
@@ -958,7 +1063,11 @@ final class Provisioner
             throw new CliException('No usable terminal command found after installation.', ExitCode::PACKAGE);
         }
 
-        $fileManager = $this->runner->firstExisting(['pcmanfm', 'thunar', 'xdg-open']) ?? 'xdg-open';
+        $fileManager = $this->runner->firstExisting(['pcmanfm']);
+        if ($fileManager === null) {
+            $fileManager = $terminal;
+            $this->report->addIssue('No dedicated file manager command found after installation; launcher key will fall back to terminal.');
+        }
 
         $hasScreenshotStack = $this->runner->exists('maim')
             && $this->runner->exists('slop')
@@ -1053,7 +1162,7 @@ final class Provisioner
             'launcher_shortcut' => 'Mod4-d',
             'terminal_shortcut' => 'Mod4-Return',
             'notification_timeout' => 6000,
-            'session_components' => ['dbus', 'dunst', 'picom', 'feh', 'pipewire', 'wireplumber'],
+            'session_components' => ['dbus', 'elogind', 'dunst', 'picom', 'feh', 'pipewire', 'wireplumber'],
             'theme_noise' => 'low',
             'keybindings_documented' => true,
             'immediate_usability' => true,
@@ -1085,6 +1194,10 @@ export XDG_CURRENT_DESKTOP=herbstluftwm
 export XDG_SESSION_TYPE=x11
 export TERMINAL={$terminal}
 
+if [ -z "\${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/\$(id -u)" ]; then
+    export XDG_RUNTIME_DIR="/run/user/\$(id -u)"
+fi
+
 hc() { herbstclient "\$@"; }
 
 if command -v xrdb >/dev/null 2>&1 && [ -f "\$HOME/.Xresources" ]; then
@@ -1096,7 +1209,7 @@ if command -v xsetroot >/dev/null 2>&1; then
 fi
 
 if command -v dbus-update-activation-environment >/dev/null 2>&1; then
-    dbus-update-activation-environment DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE >/dev/null 2>&1 || true
+    dbus-update-activation-environment DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_RUNTIME_DIR >/dev/null 2>&1 || true
 fi
 
 if command -v pipewire >/dev/null 2>&1 && ! pgrep -u "\$(id -u)" -x pipewire >/dev/null 2>&1; then
@@ -1119,10 +1232,8 @@ if command -v picom >/dev/null 2>&1 && ! pgrep -u "\$(id -u)" -x picom >/dev/nul
     picom --config /dev/null --backend xrender --vsync >/dev/null 2>&1 &
 fi
 
-if command -v feh >/dev/null 2>&1; then
-    if [ -f "\$HOME/.local/share/backgrounds/default-desktop-bg.png" ]; then
-        feh --no-fehbg --bg-fill "\$HOME/.local/share/backgrounds/default-desktop-bg.png" >/dev/null 2>&1 || true
-    fi
+if command -v feh >/dev/null 2>&1 && [ -f "\$HOME/.local/share/backgrounds/default-desktop-bg.png" ]; then
+    feh --no-fehbg --bg-fill "\$HOME/.local/share/backgrounds/default-desktop-bg.png" >/dev/null 2>&1 || true
 fi
 
 hc emit_hook reload
@@ -1417,6 +1528,10 @@ export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=herbstluftwm
 export XDG_SESSION_DESKTOP=herbstluftwm
 
+if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+
 if command -v elogind-launch >/dev/null 2>&1 && command -v dbus-launch >/dev/null 2>&1; then
     exec elogind-launch dbus-launch --exit-with-session herbstluftwm
 fi
@@ -1446,7 +1561,7 @@ Daily-use shortcuts
 -------------------
 Super + Enter         Open terminal ({$terminal})
 Super + d             Open launcher (rofi)
-Super + c             Open file manager ({$fileManager})
+Super + c             Open file manager or fallback command ({$fileManager})
 Super + Shift + q     Close focused window
 Super + Shift + r     Reload herbstluftwm config
 Super + s             Toggle floating for focused window
@@ -1462,14 +1577,10 @@ Startup
 -------
 Run: startx
 
-Design choices
+Recovery notes
 --------------
-- conservative, readable colors
-- neutral dark background with light foreground
-- minimal visual noise
-- no decorative transparency
-- practical default bindings
-- restrained notifications
+- If this machine was just switched from mdev to eudev, reboot once if input still behaves strangely.
+- If group memberships changed, fully log out before trying startx again.
 
 Project paths
 -------------
@@ -1553,6 +1664,7 @@ TXT;
         fwrite(STDOUT, "Persistent log file: " . $this->logger->path() . "\n");
         fwrite(STDOUT, "UX/UI report: " . $user->home . "/.config/alpine-lapaz/ux-validation-report.txt\n");
         fwrite(STDOUT, "Quick help: " . $user->home . "/.config/alpine-lapaz/README.txt\n");
+
         fwrite(STDOUT, "\nManual next step:\n");
         fwrite(STDOUT, "  Log in as {$user->username} and run: startx\n");
 
@@ -1609,7 +1721,7 @@ function main(array $argv): int
     $transactionDir = "/var/backups/alpine-lapaz/txn-{$timestamp}";
 
     $logger = new Logger($logFile);
-    $progress = new ProgressRenderer(9, $logger);
+    $progress = new ProgressRenderer(11, $logger);
     $runner = new CommandRunner($logger);
     $backupManager = new BackupManager($transactionDir, $logger);
     $fileManager = new FileManager($logger, $backupManager);
